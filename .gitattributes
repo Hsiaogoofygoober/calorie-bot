@@ -1,0 +1,2 @@
+# hook 是 sh 腳本，換行必須是 LF，否則 Git for Windows 執行時會出錯
+.githooks/pre-commit text eol=lf

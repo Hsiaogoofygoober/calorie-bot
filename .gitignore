@@ -1,0 +1,20 @@
+# 金鑰：只允許 .env.example（裡面不填值）
+.env
+.env.*
+!.env.example
+
+# 資料庫（含家人的飲食與身體紀錄）
+*.db
+*.db-journal
+
+# 測試用的餐點照片、體脂計截圖
+*.jpg
+*.jpeg
+*.png
+*.heic
+
+.venv/
+__pycache__/
+
+backups/
+logs/

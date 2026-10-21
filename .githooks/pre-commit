@@ -1,0 +1,3 @@
+#!/bin/sh
+# 每次 commit 前檢查有沒有金鑰；啟用方式：git config core.hooksPath .githooks
+exec python .githooks/check_secrets.py
