@@ -14,6 +14,8 @@ SYSTEM_PROMPT = """你是台灣的飲食紀錄助理。先判斷輸入是哪一�
 - 食物：食物照片或文字描述的餐點
 - 身體組成：體脂計／體重計 App 的身體組成報告截圖
 - 其他：都不是
+有多張照片時，它們是「同一餐」（不同的菜、飲料、不同角度）或「同一份報告」（分段截圖），
+請合併成一個完整結果：同一道菜出現在多張照片裡只算一次；報告的數值合併讀取。
 
 【食物】用「211 餐盤」原則分析：餐盤體積 1/2 蔬菜、1/4 蛋白質（豆魚蛋肉）、1/4 全穀澱粉。
 照片通常有使用者的手放在旁邊當比例尺（成人手掌寬約 8 公分）。
@@ -196,16 +198,22 @@ class Analyzer:
                 last_error = e
         raise last_error
 
-    def analyze(self, image: bytes | None = None, text: str | None = None,
+    def analyze(self, images: list[bytes] | None = None, text: str | None = None,
                 mime_type: str = "image/jpeg", context: str | None = None,
                 note: str | None = None, previous: list[dict] | None = None,
                 correction: str | None = None) -> Analysis:
-        """note：對照片的補充說明；context：使用者狀態與今日進度。
-        previous + correction：修正上一次的分析（使用者指出哪裡錯）。"""
-        contents: list = []
-        if image:
-            contents.append(types.Part.from_bytes(data=image, mime_type=mime_type))
-        prompt = text or "請分析這張圖片。"
+        """images：同一餐（或同一份報告）的一或多張照片；note：補充說明；
+        context：使用者狀態與今日進度；previous + correction：修正上一次的分析。"""
+        images = images or []
+        # LINE 的照片都是 JPEG；本機測試可能混 PNG，依檔頭判斷
+        contents: list = [types.Part.from_bytes(
+            data=img, mime_type="image/png" if img[:4] == b"\x89PNG" else mime_type)
+            for img in images]
+        if len(images) > 1:
+            default = f"請分析這 {len(images)} 張照片（同一餐或同一份報告），合併成一個結果。"
+        else:
+            default = "請分析這張圖片。"
+        prompt = text or default
         if note:
             prompt += f"\n\n使用者補充說明（以此為準）：{note}"
         if previous is not None and correction:

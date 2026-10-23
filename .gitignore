@@ -18,3 +18,4 @@ __pycache__/
 
 backups/
 logs/
+.pytest_cache/

@@ -1,11 +1,11 @@
 """不用 LINE，直接在電腦上測試辨識。
 
 python try_analyze.py 便當.jpg
+python try_analyze.py 主餐.jpg 飲料.jpg            # 多張照片當成同一餐
 python try_analyze.py 便當.jpg --note "肉是煎雞胸和煎魚"
 python try_analyze.py --text "半糖珍奶大杯"
 """
 import argparse
-import mimetypes
 import os
 
 from dotenv import load_dotenv
@@ -16,7 +16,7 @@ from nutrition import NutritionDB
 load_dotenv()
 
 parser = argparse.ArgumentParser()
-parser.add_argument("image", nargs="?")
+parser.add_argument("images", nargs="*", help="一或多張照片（同一餐）")
 parser.add_argument("--text")
 parser.add_argument("--note", help="對照片的補充說明")
 args = parser.parse_args()
@@ -27,19 +27,18 @@ analyzer = Analyzer(os.environ["GEMINI_API_KEY"],
                     NutritionDB() if use_db else None,
                     fallback_model=os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.6-flash"))
 
-image, mime = None, "image/jpeg"
-if args.image:
-    with open(args.image, "rb") as f:
-        image = f.read()
-    mime = mimetypes.guess_type(args.image)[0] or mime
+images = []
+for path in args.images:
+    with open(path, "rb") as f:
+        images.append(f.read())
 
-analysis = analyzer.analyze(image=image, text=args.text, mime_type=mime, note=args.note)
-print("模型：", analyzer.last_model, "｜類型：", analysis.kind.value)
+analysis = analyzer.analyze(images=images, text=args.text, note=args.note)
+print("模型：", analyzer.last_model, "｜照片：", len(images), "張｜類型：", analysis.kind.value)
 if analysis.body:
-    from body import compute_targets, format_report
+    from body import format_report, rules_plan
     print(format_report(analysis.body))
-    kcal, protein, notes = compute_targets(analysis.body)
-    print("\n".join(notes))
+    if plan := rules_plan(analysis.body):
+        print(f"（固定規則參考）每日 {plan['kcal']} kcal｜蛋白質 {plan['protein_g']}g")
     raise SystemExit
 items = analyzer.build_items(analysis)
 for i in items:

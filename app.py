@@ -22,6 +22,7 @@ from linebot.v3.webhooks import (
 )
 
 import body
+import intake
 from analyzer import Analysis, Analyzer, BodyMetrics, Kind
 from nutrition import NutritionDB
 from storage import Storage
@@ -45,9 +46,11 @@ app = FastAPI()
 HELP_TEXT = (
     "📷 傳餐點照片（把手放在旁邊當比例尺），或直接打字（例：半糖珍奶大杯）就會記錄，"
     "並用 211 餐盤（蔬菜½、蛋白質¼、全穀澱粉¼）分析\n"
+    "　同一餐可以傳多張照片（最多 6 張）一起分析\n"
     "　傳照片後可以補充說明（例：肉是煎雞胸、飯只吃一半）\n"
     "📊 傳體脂計截圖，AI 營養師會規劃你的每日熱量與營養素\n"
-    "　可以補充目標（例：想減脂、每週重訓兩次）\n\n"
+    "　可以補充目標（例：想減脂、每週重訓兩次）\n"
+    "📝 沒有體脂計？輸入「基本資料」，回答幾個問題就能算出 TDEE\n\n"
     "・修改上一筆：AI 判斷錯了，直接跟它說哪裡錯\n"
     "・換照片：照片傳錯了\n"
     "・刪除上一筆\n"
@@ -56,7 +59,7 @@ HELP_TEXT = (
 )
 MEAL_QUICK = ["修改上一筆", "換照片", "今日"]
 ANALYZE_NOW, CANCEL = "直接分析", "取消"
-NOTE_QUICK = [ANALYZE_NOW, CANCEL]
+NOTE_QUICK = [ANALYZE_NOW, "換照片", CANCEL]
 SKIP_WORDS = {ANALYZE_NOW, "不用", "沒有", "不用補充", "否", "no", "No"}
 DISCLAIMER = "※ 體脂計數值與 AI 建議僅供參考，有慢性病（如腎臟病、糖尿病）請先諮詢醫師"
 
@@ -79,8 +82,9 @@ def health():
 
 # ---------- 對話狀態（只放記憶體、不寫硬碟；Bot 重啟就清空） ----------
 # _state：正在等使用者回覆的事
-#   {"mode": "note", "image": bytes}：照片等補充說明
+#   {"mode": "note", "images": [bytes, ...]}：同一餐的照片等補充說明
 #   {"mode": "fix"}：等使用者說上一筆哪裡錯
+#   {"mode": "intake", ...}：問答填寫基本資料
 # _last_meal：最近一筆紀錄的原始輸入（照片／文字），修改時讓 AI 重看一次
 STATE_TTL = 30 * 60       # 超過 30 分鐘沒回應就放棄，避免之後的文字被誤判
 LAST_MEAL_TTL = 6 * 3600  # 6 小時內的紀錄還能帶照片重新判斷
@@ -111,10 +115,50 @@ def pop_state(user_id: str) -> tuple[dict | None, bool]:
     return s, False
 
 
-def remember_meal(user_id: str, meal_id: int, image: bytes | None,
+MAX_PHOTOS = 6  # 一餐最多幾張照片
+
+
+def add_photo(user_id: str, image: bytes | None, set_id: str | None,
+              set_total: int) -> dict:
+    """把照片加進等待中的這一批（同一餐）。在鎖裡完成，因為一次傳多張時
+    LINE 可能同時送來好幾個請求。
+
+    回傳 {"reply": 這次是否該回覆, "count", "failed", "overflow",
+          "from_fix": 是否從「修改上一筆」轉來（只有一個請求會拿到 True）}"""
+    with _lock:
+        s = _state.get(user_id)
+        fresh = s and time.time() - s["ts"] < STATE_TTL
+        from_fix = bool(fresh and s["mode"] == "fix")
+        if not (fresh and s["mode"] == "note"):
+            s = {"mode": "note", "images": [], "failed": 0, "overflow": 0, "sets": {}}
+        if image is None:
+            s["failed"] += 1
+        elif len(s["images"]) < MAX_PHOTOS:
+            s["images"].append(image)
+        else:
+            s["overflow"] += 1
+        if from_fix:
+            s["notice"] = "🗑️ 已刪除上一筆，改用新照片\n"
+        s["ts"] = time.time()
+        _state[user_id] = s
+        # 一次送出多張：整批到齊才回覆一次；一張一張傳：每張都回覆
+        if set_id:
+            s["sets"][set_id] = s["sets"].get(set_id, 0) + 1
+            should_reply = s["sets"][set_id] >= set_total
+        else:
+            should_reply = True
+        result = {"reply": should_reply, "count": len(s["images"]), "failed": s["failed"],
+                  "overflow": s["overflow"], "from_fix": from_fix}
+        if should_reply:
+            result["notice"] = s.pop("notice", "")
+            s["failed"] = s["overflow"] = 0  # 已經告知過了
+        return result
+
+
+def remember_meal(user_id: str, meal_id: int, images: list[bytes],
                   text: str | None, note: str | None) -> None:
     with _lock:
-        _last_meal[user_id] = {"meal_id": meal_id, "image": image, "text": text,
+        _last_meal[user_id] = {"meal_id": meal_id, "images": images, "text": text,
                                "note": note, "ts": time.time()}
 
 
@@ -229,11 +273,12 @@ def user_context(user_id: str) -> str:
 
 # ---------- 分析 ----------
 
-def handle_input(user_id: str, reply_token: str, image: bytes | None = None,
+def handle_input(user_id: str, reply_token: str, images: list[bytes] | None = None,
                  text: str | None = None, note: str | None = None) -> None:
-    """text：純文字描述的餐點；note：家人對照片的補充說明。"""
+    """images：同一餐的照片；text：純文字描述的餐點；note：家人對照片的補充說明。"""
+    images = images or []
     try:
-        analysis = analyzer.analyze(image=image, text=text, note=note,
+        analysis = analyzer.analyze(images=images, text=text, note=note,
                                     context=user_context(user_id))
     except Exception:
         log.exception("Gemini 分析失敗")
@@ -245,8 +290,9 @@ def handle_input(user_id: str, reply_token: str, image: bytes | None = None,
     elif analysis.kind == Kind.food and analysis.items:
         items = analyzer.build_items(analysis)
         meal_id = storage.add_meal(user_id, items)
-        remember_meal(user_id, meal_id, image, text, note)
-        reply(reply_token, meal_message("🍱 已記錄", user_id, items, analysis),
+        remember_meal(user_id, meal_id, images, text, note)
+        title = f"🍱 已記錄（{len(images)} 張照片）" if len(images) > 1 else "🍱 已記錄"
+        reply(reply_token, meal_message(title, user_id, items, analysis),
               with_quick_reply=True)
     else:
         reply(reply_token, "看不出是食物或身體報告喔～\n\n" + HELP_TEXT)
@@ -265,7 +311,7 @@ def apply_fix(user_id: str, reply_token: str, correction: str) -> None:
     show_loading(user_id)
     try:
         analysis = analyzer.analyze(
-            image=source["image"] if source else None,
+            images=source["images"] if source else None,
             text=source["text"] if source else "（原始照片已不在，請依上一次的結果修改）",
             note=source["note"] if source else None,
             context=user_context(user_id), previous=meal["items"], correction=correction,
@@ -281,16 +327,14 @@ def apply_fix(user_id: str, reply_token: str, correction: str) -> None:
     items = analyzer.build_items(analysis)
     storage.update_meal(meal["id"], items)
     if source:
-        remember_meal(user_id, meal["id"], source["image"], source["text"], source["note"])
+        remember_meal(user_id, meal["id"], source["images"], source["text"], source["note"])
     reply(reply_token, meal_message("✏️ 已修改上一筆", user_id, items, analysis),
           with_quick_reply=True)
 
 
-def save_body_report(user_id: str, reply_token: str, metrics: BodyMetrics,
-                     goal_note: str | None = None) -> None:
-    prev, _, prev_date = latest_body(user_id)
-    storage.add_body_report(user_id, metrics.model_dump())
-
+def make_plan(user_id: str, metrics: BodyMetrics, prev: BodyMetrics | None,
+              goal_note: str | None) -> dict | None:
+    """AI 營養師規劃（失敗改用固定規則），套用安全底線後存起來。"""
     show_loading(user_id, 60)  # 營養規劃要多想一下
     try:
         plan = analyzer.plan(metrics, prev, goal_note).model_dump()
@@ -298,17 +342,83 @@ def save_body_report(user_id: str, reply_token: str, metrics: BodyMetrics,
     except Exception:
         log.exception("AI 營養規劃失敗，改用固定規則")
         plan = body.rules_plan(metrics)
+    if plan:
+        plan, adjustments = body.guard_plan(plan, metrics)
+        plan["adjustments"] = adjustments
+        storage.set_plan(user_id, plan)
+    return plan
+
+
+def save_body_report(user_id: str, reply_token: str, metrics: BodyMetrics,
+                     goal_note: str | None = None) -> None:
+    prev, _, prev_date = latest_body(user_id)
+    storage.add_body_report(user_id, metrics.model_dump())
+    # 曾用問答填過基本資料的話，性別、年齡、身高也提供給營養師參考
+    if profile := storage.get_profile(user_id):
+        sex = "男性" if profile["sex"] == "male" else "女性"
+        about = f"{sex}、{profile['age']:g} 歲、身高 {profile['height']:g} cm"
+        goal_note = f"{about}。{goal_note or profile.get('goal') or ''}".rstrip("。") + "。"
+    plan = make_plan(user_id, metrics, prev, goal_note)
 
     msg = "📊 已更新身體狀態\n" + body.format_report(metrics, prev)
     if prev_date:
         msg += f"\n（括號內為與 {prev_date} 相比）"
     if plan:
-        plan, adjustments = body.guard_plan(plan, metrics)
-        plan["adjustments"] = adjustments
-        storage.set_plan(user_id, plan)
         msg += "\n━━━━━━━━\n" + body.format_plan(plan)
     else:
         msg += "\n\n截圖裡沒有代謝數值，每日目標維持不變"
+    reply(reply_token, msg + "\n\n" + DISCLAIMER)
+
+
+# ---------- 問答填寫基本資料（沒有體脂計時） ----------
+
+INTAKE_WORDS = {"基本資料", "填寫基本資料", "計算TDEE", "計算tdee", "TDEE", "tdee"}
+NO_DATA_HINT = ("還沒有身體資料喔，兩種方式擇一：\n"
+                "📊 傳一張體脂計的身體組成截圖\n"
+                "📝 沒有體脂計？按「填寫基本資料」，回答 6 個問題就能算出你的 TDEE")
+
+
+def ask_intake(user_id: str, reply_token: str, step: int, answers: dict,
+               prefix: str = "") -> None:
+    set_state(user_id, mode="intake", step=step, answers=answers)
+    _, question, buttons = intake.STEPS[step]
+    reply(reply_token, prefix + question, quick=(buttons or []) + [CANCEL])
+
+
+def start_intake(user_id: str, reply_token: str) -> None:
+    ask_intake(user_id, reply_token, 0, {},
+               prefix="📝 用幾個問題算出你的基礎代謝（BMR）和每日總消耗（TDEE）\n"
+                      "隨時可以按「取消」\n\n")
+
+
+def handle_intake(user_id: str, reply_token: str, text: str, state: dict) -> None:
+    step, answers = state["step"], dict(state["answers"])
+    field = intake.STEPS[step][0]
+    value = intake.parse(field, text)
+    if value is None and field != "goal":
+        ask_intake(user_id, reply_token, step, answers,
+                   prefix=f"「{text}」好像不太對，{intake.retry_hint(field)}\n\n")
+        return
+    answers[field] = value
+    if step + 1 < len(intake.STEPS):
+        ask_intake(user_id, reply_token, step + 1, answers)
+        return
+    finish_intake(user_id, reply_token, answers)
+
+
+def finish_intake(user_id: str, reply_token: str, profile: dict) -> None:
+    calc = intake.compute(profile)
+    metrics = intake.to_metrics(profile, calc)
+    prev, _, _ = latest_body(user_id)
+    storage.set_profile(user_id, profile)
+    storage.add_body_report(user_id, metrics.model_dump())
+    plan = make_plan(user_id, metrics, prev, intake.describe(profile, calc))
+
+    msg = intake.format_calc(profile, calc)
+    if plan:
+        msg += "\n━━━━━━━━\n" + body.format_plan(plan)
+    msg += ("\n\n之後體重有變化，再輸入「基本資料」重新計算即可；"
+            "有體脂計的話，傳截圖會更準確")
     reply(reply_token, msg + "\n\n" + DISCLAIMER)
 
 
@@ -330,7 +440,7 @@ def today_summary(user_id: str, reply_token: str) -> None:
 def body_status(user_id: str, reply_token: str) -> None:
     current, prev, date = latest_body(user_id)
     if not current:
-        reply(reply_token, "還沒有身體狀態喔，傳一張體脂計的身體組成截圖給我 📊")
+        reply(reply_token, NO_DATA_HINT, quick=["填寫基本資料"])
         return
     msg = f"📊 身體狀態（{date}）\n" + body.format_report(current, prev)
     msg += f"\n━━━━━━━━\n{remaining_line(user_id)}"
@@ -342,8 +452,7 @@ def body_status(user_id: str, reply_token: str) -> None:
 def show_plan(user_id: str, reply_token: str) -> None:
     plan = storage.get_plan(user_id)
     if not plan:
-        reply(reply_token, "還沒有營養計畫喔，傳一張體脂計的身體組成截圖給我，"
-                           "可以順便補充你的目標 📊")
+        reply(reply_token, NO_DATA_HINT, quick=["填寫基本資料"])
         return
     reply(reply_token, body.format_plan(plan) + "\n\n" + DISCLAIMER)
 
@@ -351,11 +460,26 @@ def show_plan(user_id: str, reply_token: str) -> None:
 # ---------- LINE 事件 ----------
 
 ASK_NOTE = (
-    "📷 收到照片！要補充說明嗎？\n"
+    "要補充說明嗎？\n"
     "例如：「肉是煎雞胸和煎魚」「飯只吃一半」「飲料無糖」\n"
     "體脂截圖可以補充目標：「想減脂、每週重訓兩次」\n\n"
     "直接打字補充，或按「直接分析」"
 )
+
+
+def photo_prompt(r: dict) -> str:
+    """收到照片後的回覆：張數、異常提醒、詢問補充說明。"""
+    n = r["count"]
+    lines = [r.get("notice", "")]
+    if n == 1:
+        lines.append("📷 收到照片！同一餐還有其他照片可以繼續傳（最多 6 張）")
+    else:
+        lines.append(f"📷 收到 {n} 張照片！會當成同一餐一起分析")
+    if r["failed"]:
+        lines.append(f"⚠️ 有 {r['failed']} 張照片下載失敗，需要的話請再傳一次")
+    if r["overflow"]:
+        lines.append(f"⚠️ 一餐最多 {MAX_PHOTOS} 張，多出的 {r['overflow']} 張沒有收進來")
+    return "".join(lines[:1]) + "\n".join(lines[1:]) + "\n\n" + ASK_NOTE
 FIX_PROMPT = (
     "✏️ 上一筆記錄的是：\n{items}\n\n"
     "哪裡要改？直接跟我說，例如：\n"
@@ -366,29 +490,36 @@ FIX_PROMPT = (
 @handler.add(FollowEvent)
 def on_follow(event: FollowEvent):
     reply(event.reply_token, "👋 歡迎使用減脂小幫手！\n\n" + HELP_TEXT
-          + "\n\n建議先傳一張體脂計截圖，讓營養師幫你規劃每日目標 📊")
+          + "\n\n建議先傳一張體脂計截圖，或按「填寫基本資料」，讓營養師幫你規劃每日目標 📊",
+          quick=["填寫基本資料"])
 
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def on_image(event: MessageEvent):
-    """先暫存照片並詢問補充說明；分析等家人回覆後再做。"""
+    """暫存照片（同一餐可以多張）並詢問補充說明；分析等家人回覆後再做。"""
     user_id = event.source.user_id
-    with ApiClient(line_config) as client:
-        image = bytes(MessagingApiBlob(client).get_message_content(event.message.id))
+    image_set = event.message.image_set  # 一次送出多張時才有：同一批的 id、第幾張、共幾張
+    try:
+        with ApiClient(line_config) as client:
+            image = bytes(MessagingApiBlob(client).get_message_content(event.message.id))
+    except Exception:
+        log.exception("下載照片失敗")
+        image = None
 
-    state = peek_state(user_id)
-    prefix = ""
-    if state and state["mode"] == "note":
-        prefix = "（已改用這張新照片，前一張不記錄）\n"
-    elif state and state["mode"] == "fix":
-        # 正在修改上一筆時傳照片 → 視為照片傳錯，換成這張
-        meal = storage.last_meal(user_id)
-        if meal:
+    r = add_photo(user_id, image,
+                  image_set.id if image_set else None, image_set.total if image_set else 1)
+    if r["from_fix"]:
+        # 正在「修改上一筆」時傳照片 → 視為照片傳錯，刪掉上一筆、改用新照片
+        if meal := storage.last_meal(user_id):
             storage.delete_meal(meal["id"])
             forget_meal(user_id)
-            prefix = "🗑️ 已刪除上一筆，改用這張新照片\n"
-    set_state(user_id, mode="note", image=image)
-    reply(event.reply_token, prefix + ASK_NOTE, quick=NOTE_QUICK)
+    if not r["reply"]:
+        return  # 同一批還沒到齊，等最後一張再回覆
+    if r["count"] == 0:
+        pop_state(user_id)
+        reply(event.reply_token, "照片下載失敗了，請再傳一次 📷")
+        return
+    reply(event.reply_token, photo_prompt(r), quick=NOTE_QUICK)
 
 
 @handler.add(MessageEvent, message=TextMessageContent)
@@ -402,9 +533,11 @@ def on_text(event: MessageEvent):
         return
 
     state, expired = pop_state(user_id)
-    if state and state["mode"] == "note":
+    if state and state["mode"] == "intake":
+        handle_intake(user_id, token, text, state)
+    elif state and state["mode"] == "note":
         show_loading(user_id)
-        handle_input(user_id, token, image=state["image"],
+        handle_input(user_id, token, images=state["images"],
                      note=None if text in SKIP_WORDS else text)
     elif state and state["mode"] == "fix":
         apply_fix(user_id, token, text)
@@ -428,11 +561,13 @@ def run_command(user_id: str, token: str, text: str) -> bool:
         body_status(user_id, token)
     elif text in ("營養計畫", "計畫"):
         show_plan(user_id, token)
+    elif text in INTAKE_WORDS:
+        start_intake(user_id, token)
     elif text == "修改上一筆":
         state = peek_state(user_id)
         meal = storage.last_meal(user_id)
         if state and state["mode"] == "note":
-            reply(token, "你有一張照片還沒分析，先按「直接分析」或「取消」喔", quick=NOTE_QUICK)
+            reply(token, "你有照片還沒分析，先按「直接分析」或「取消」喔", quick=NOTE_QUICK)
         elif not meal:
             reply(token, "今天還沒有可以修改的紀錄喔")
         else:
@@ -440,10 +575,14 @@ def run_command(user_id: str, token: str, text: str) -> bool:
             reply(token, FIX_PROMPT.format(items=format_items(meal["items"])),
                   quick=[CANCEL])
     elif text == "換照片":
-        state, _ = pop_state(user_id)
+        state = peek_state(user_id)
+        if state and state["mode"] in ("note", "fix"):
+            pop_state(user_id)
         meal = storage.last_meal(user_id)
         if state and state["mode"] == "note":
-            reply(token, "好的，這張照片不記錄，請重新傳一張 📷")
+            n = len(state["images"])
+            reply(token, ("好的，這張照片不記錄" if n == 1 else f"好的，這 {n} 張照片都不記錄")
+                  + "，請重新傳 📷")
         elif meal:
             storage.delete_meal(meal["id"])
             forget_meal(user_id)
@@ -453,7 +592,7 @@ def run_command(user_id: str, token: str, text: str) -> bool:
             reply(token, "目前沒有可以換的照片喔")
     elif text == CANCEL:
         state, _ = pop_state(user_id)
-        reply(token, "已取消，這張照片不記錄" if state and state["mode"] == "note"
+        reply(token, "已取消，照片不記錄" if state and state["mode"] == "note"
               else "已取消" if state else "目前沒有進行中的動作")
     elif text == "刪除上一筆":
         meal = storage.last_meal(user_id)

@@ -48,7 +48,7 @@ class Storage:
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(users)")}
         with self.conn:
             for col, typ in (("carb_goal_g", "INTEGER"), ("fat_goal_g", "INTEGER"),
-                             ("plan_json", "TEXT")):
+                             ("plan_json", "TEXT"), ("profile_json", "TEXT")):
                 if col not in cols:
                     self.conn.execute(f"ALTER TABLE users ADD COLUMN {col} {typ}")
 
@@ -64,6 +64,21 @@ class Storage:
                 (user_id, plan["kcal"], plan.get("protein_g"), plan.get("carb_g"),
                  plan.get("fat_g"), json.dumps(plan, ensure_ascii=False)),
             )
+
+    def set_profile(self, user_id: str, profile: dict) -> None:
+        """問答填寫的基本資料（性別、年齡、身高、體重、活動量、目標）。"""
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO users(user_id, goal_kcal, profile_json) VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET profile_json = excluded.profile_json",
+                (user_id, self.default_goal, json.dumps(profile, ensure_ascii=False)),
+            )
+
+    def get_profile(self, user_id: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT profile_json FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return json.loads(row["profile_json"]) if row and row["profile_json"] else None
 
     def get_plan(self, user_id: str) -> dict | None:
         row = self.conn.execute(

@@ -8,6 +8,8 @@ AI 規劃失敗時改用固定規則（rules_plan）：
 - 需要減脂（脂肪控制 < 0）→ 每日消耗 − 300 kcal，但不低於基礎代謝
 - 蛋白質：體重 × 1.2 g；需要增肌 → × 1.5 g
 """
+import math
+
 from analyzer import BodyMetrics
 
 DEFICIT_KCAL = 300
@@ -22,16 +24,20 @@ def needs_muscle(m: BodyMetrics) -> bool:
     return any(k in f for f in m.flags for k in ("蛋白質", "肌肉", "儲肌") if "偏低" in f)
 
 
+def round_kcal(kcal: float, floor: float | None = None) -> int:
+    """取整到十位數；有下限時向上進位，避免 1273 → 1270 反而低於基礎代謝。"""
+    if floor and kcal <= floor:
+        return int(math.ceil(floor / 10) * 10)
+    return int(round(kcal / 10) * 10)
+
+
 def rules_plan(m: BodyMetrics) -> dict | None:
     """AI 規劃失敗時的備案；資料不足（沒有代謝數值）回傳 None。"""
     tdee = m.activity_kcal or (m.bmr_kcal * 1.3 if m.bmr_kcal else None)
     if not tdee:
         return None
     lose_fat = bool(m.fat_control_kg and m.fat_control_kg < 0)
-    kcal = tdee - DEFICIT_KCAL if lose_fat else tdee
-    if m.bmr_kcal:
-        kcal = max(kcal, m.bmr_kcal)
-    kcal = int(round(kcal / 10) * 10)
+    kcal = round_kcal(tdee - DEFICIT_KCAL if lose_fat else tdee, m.bmr_kcal)
     protein = int(round(m.weight_kg * (PROTEIN_MUSCLE if needs_muscle(m) else PROTEIN_BASE))) \
         if m.weight_kg else None
     fat = int(round(kcal * 0.28 / 9))
@@ -51,8 +57,9 @@ def guard_plan(plan: dict, m: BodyMetrics) -> tuple[dict, list[str]]:
     """套用安全底線；回傳 (調整後的規劃, 調整說明)。"""
     notes = []
     if m.bmr_kcal and plan["kcal"] < m.bmr_kcal:
-        notes.append(f"熱量 {plan['kcal']} 低於基礎代謝，已調整為 {m.bmr_kcal:.0f}")
-        plan["kcal"] = int(round(m.bmr_kcal / 10) * 10)
+        new = round_kcal(plan["kcal"], m.bmr_kcal)
+        notes.append(f"熱量 {plan['kcal']} 低於基礎代謝 {m.bmr_kcal:.0f}，已調整為 {new}")
+        plan["kcal"] = new
     if m.weight_kg and plan.get("protein_g"):
         lo, hi = m.weight_kg * PROTEIN_MIN, m.weight_kg * PROTEIN_MAX
         if not lo <= plan["protein_g"] <= hi:
@@ -98,12 +105,20 @@ def format_report(m: BodyMetrics, prev: BodyMetrics | None = None) -> str:
         return "—" if x is None else fmt.format(x)
 
     p = prev or BodyMetrics.model_construct(**{k: None for k in BodyMetrics.model_fields})
-    lines = [
-        f"體重 {v(m.weight_kg)}kg{_delta(m.weight_kg, p.weight_kg, 'kg')}"
-        f"｜體脂 {v(m.body_fat_pct)}%{_delta(m.body_fat_pct, p.body_fat_pct, '%')}",
-        f"BMI {v(m.bmi)}｜肌肉率 {v(m.muscle_pct)}%{_delta(m.muscle_pct, p.muscle_pct, '%')}",
-        f"基礎代謝 {v(m.bmr_kcal, '{:.0f}')}｜活動代謝 {v(m.activity_kcal, '{:.0f}')} kcal",
-    ]
+
+    def join(*parts: str | None) -> str | None:
+        parts = [x for x in parts if x]
+        return "｜".join(parts) if parts else None
+
+    # 沒有的數值（例：問答填寫沒有體脂）就不顯示
+    lines = [x for x in (
+        join(m.weight_kg and f"體重 {v(m.weight_kg)}kg{_delta(m.weight_kg, p.weight_kg, 'kg')}",
+             m.body_fat_pct and f"體脂 {v(m.body_fat_pct)}%{_delta(m.body_fat_pct, p.body_fat_pct, '%')}"),
+        join(m.bmi and f"BMI {v(m.bmi)}",
+             m.muscle_pct and f"肌肉率 {v(m.muscle_pct)}%{_delta(m.muscle_pct, p.muscle_pct, '%')}"),
+        join(m.bmr_kcal and f"基礎代謝 {v(m.bmr_kcal, '{:.0f}')}",
+             m.activity_kcal and f"每日消耗 {v(m.activity_kcal, '{:.0f}')} kcal"),
+    ) if x]
     if m.flags:
         lines.append("⚠️ " + "、".join(m.flags))
     return "\n".join(lines)

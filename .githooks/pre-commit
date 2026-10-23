@@ -1,3 +1,16 @@
 #!/bin/sh
-# 每次 commit 前檢查有沒有金鑰；啟用方式：git config core.hooksPath .githooks
-exec python .githooks/check_secrets.py
+# 每次 commit 前：1. 檢查有沒有金鑰  2. 跑自動測試（有 .venv 才跑）
+# 啟用方式：git config core.hooksPath .githooks
+python .githooks/check_secrets.py || exit 1
+
+VENV_PY=".venv/Scripts/python.exe"
+[ -x "$VENV_PY" ] || VENV_PY=".venv/bin/python"
+if [ -x "$VENV_PY" ]; then
+    echo "🧪 執行自動測試..."
+    "$VENV_PY" -m pytest -q -p no:warnings || {
+        echo "🚫 測試沒通過，已阻止 commit（修好後再 commit）"
+        exit 1
+    }
+else
+    echo "⚠️ 找不到 .venv，略過自動測試"
+fi
